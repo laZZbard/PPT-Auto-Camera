@@ -28,7 +28,7 @@ input[type=range]{width:100%}.thumbs{display:grid;grid-template-columns:repeat(3
 <h1>PPT 自动相机</h1>
 <div class="stage"><video id="video" playsinline autoplay muted></video><div class="roi"></div></div>
 <div class="status" id="status">先启动相机</div>
-<div class="debug" id="debug">检测器 v4 · 单页防重复模式</div>
+<div class="debug" id="debug">检测器 v5 · SSIM + 边缘 + 自动标定</div>
 <div class="controls">
 <button class="primary" id="camera">启动相机</button>
 <button class="secondary" id="auto" disabled>开始自动记录</button>
@@ -36,24 +36,27 @@ input[type=range]{width:100%}.thumbs{display:grid;grid-template-columns:repeat(3
 <button class="secondary" id="export" disabled>导出本节照片</button>
 </div>
 <div class="settings">
-<label>差异阈值 <input id="change" type="range" min="2" max="12" value="5"><span id="changeV">5</span></label>
+<label>检测灵敏度 <input id="change" type="range" min="1" max="10" value="6"><span id="changeV">6</span></label>
 <label>稳定阈值 <input id="stable" type="range" min="1" max="12" value="5"><span id="stableV">5</span></label>
 <label>稳定时间 <input id="stableMs" type="range" min="300" max="2000" step="100" value="800"><span id="stableMsV">0.8s</span></label>
 <label>冷却时间 <input id="coolMs" type="range" min="800" max="5000" step="200" value="1800"><span id="coolMsV">1.8s</span></label>
 </div>
-<div class="note">开始后先保存当前页。每次拍照后，程序会等待冷却并在当前页稳定时重新建立基准，之后才允许拍摄下一页，以避免同一页重复拍摄。差异阈值越低越灵敏。</div>
+<div class="note">开始后先保存当前页，再自动采集同页样本标定当前相机和投影噪声。检测综合局部结构相似度与文字边缘变化；只有持续超过现场噪声门限才拍摄。灵敏度越高越容易检测细小变化。</div>
 <div class="thumbs" id="thumbs"></div>
 <canvas id="work" width="192" height="108" hidden></canvas>
 <canvas id="capture" hidden></canvas>
 </main>
+<script src="detector.js"></script>
 <script>
 const $=id=>document.getElementById(id);
 const video=$('video'), work=$('work'), wctx=work.getContext('2d',{willReadFrequently:true});
 const capture=$('capture'), cctx=capture.getContext('2d');
-const DETECT_W=192, DETECT_H=108, PIXEL_DELTA=10, CHANGE_CONFIRM_MS=420;
+const DETECT_W=PptDetector.WIDTH, DETECT_H=PptDetector.HEIGHT, CHANGE_CONFIRM_MS=600;
+const CALIBRATION_MS=1200, CALIBRATION_INTERVAL=100;
 let stream=null, running=false, lastPhotoFrame=null, prev=null, changing=false, saving=false, armed=false;
+let calibrating=false,calibrationFrames=[],calibrationStarted=0,lastCalibrationSample=0,noiseFloor=0,triggerThreshold=1;
 let stableSince=0, stableAnchor=null, changeSince=0, changeStartedAt=0;
-let lastShot=0, rearmAt=0, lastReferenceUpdate=0, raf=0, timer=0, runToken=0;
+let lastShot=0,lastReferenceUpdate=0,raf=0,timer=0,runToken=0;
 let shots=[];
 
 function say(s){$('status').textContent=s}
@@ -87,54 +90,45 @@ function grayFrame(){
  const d=wctx.getImageData(0,0,DETECT_W,DETECT_H).data;
  const a=new Uint8Array(DETECT_W*DETECT_H);
  for(let i=0,j=0;i<d.length;i+=4,j++) a[j]=(d[i]*3+d[i+1]*6+d[i+2])/10;
- return a;
+ return PptDetector.prepare(a);
 }
 
-// Compensate for a global brightness shift, then combine average structural
-// difference with the percentage of pixels that changed significantly. A
-// small changed text region is therefore not diluted by a large plain slide.
 function frameMetrics(a,b){
- if(!a||!b)return {mean:0,changedRatio:0,strongRatio:0,topMean:0,score:0};
- let signed=0;
- for(let i=0;i<a.length;i++) signed+=a[i]-b[i];
- const brightnessShift=signed/a.length;
- let sum=0, changed=0, strong=0;
- const histogram=new Uint16Array(256);
- for(let i=0;i<a.length;i++){
-  const delta=Math.abs((a[i]-b[i])-brightnessShift);
-  sum+=delta;
-  histogram[Math.min(255,Math.floor(delta))]++;
-  if(delta>=PIXEL_DELTA)changed++;
-  if(delta>=24)strong++;
- }
- const mean=sum/a.length;
- const changedRatio=changed*100/a.length;
- const strongRatio=strong*100/a.length;
- const topCount=Math.max(1,Math.floor(a.length*.02));
- let remaining=topCount,topSum=0;
- for(let value=255;value>=0&&remaining;value--){
-  const take=Math.min(remaining,histogram[value]);
-  topSum+=take*value;remaining-=take;
- }
- const topMean=topSum/topCount;
- return {mean,changedRatio,strongRatio,topMean,
-  score:mean+changedRatio*1.6+strongRatio*1.2+topMean*.08};
+ return PptDetector.compare(a,b);
 }
 
-function isPageChange(metrics,threshold){
- // Even a small changed text area should trigger, while sub-threshold camera
- // noise and uniform projector brightness shifts are ignored.
- return metrics.score>=threshold || metrics.changedRatio>=Math.max(.8,threshold*.18);
+function currentThreshold(sensitivity=vals().change){
+ const learned=Math.max(.7,noiseFloor*3+.35);
+ return learned*(1.42-sensitivity*.07);
+}
+
+function isPageChange(metrics,threshold=triggerThreshold){
+ return metrics.score>=threshold;
 }
 
 function detectorSelfTest(){
- const base=new Uint8Array(1000).fill(80);
- const brighter=new Uint8Array(1000).fill(92);
+ const size=DETECT_W*DETECT_H;
+ const base=new Uint8Array(size).fill(80);
+ const brighter=new Uint8Array(size).fill(92);
  const textChange=new Uint8Array(base);
- for(let i=0;i<20;i++)textChange[i]=180;
+ for(let y=30;y<38;y++)for(let x=40;x<100;x++)textChange[y*DETECT_W+x]=180;
  const brightnessIgnored=frameMetrics(brighter,base).score<.01;
- const smallTextDetected=isPageChange(frameMetrics(textChange,base),5);
- return brightnessIgnored&&smallTextDetected;
+ const smallTextDetected=frameMetrics(PptDetector.prepare(textChange),PptDetector.prepare(base)).score>.7;
+ return brightnessIgnored&&smallTextDetected&&typeof PptDetector.average==='function';
+}
+
+function beginCalibration(seed){
+ calibrationFrames=[seed];calibrationStarted=performance.now();lastCalibrationSample=calibrationStarted;
+ calibrating=true;armed=false;noiseFloor=0;
+}
+
+function finishCalibration(t){
+ lastPhotoFrame=PptDetector.average(calibrationFrames);
+ const scores=calibrationFrames.map(frame=>frameMetrics(frame,lastPhotoFrame).score);
+ noiseFloor=PptDetector.percentile(scores,.95);
+ triggerThreshold=currentThreshold();
+ calibrating=false;armed=true;lastReferenceUpdate=t;
+ say(`标定完成 · 已记录 ${shots.length} 页 · 等待翻页`);
 }
 
 async function saveFrame(referenceFrame=grayFrame()){
@@ -152,12 +146,11 @@ async function saveFrame(referenceFrame=grayFrame()){
  $('export').disabled=false;
  if(saveToken===runToken){
   lastPhotoFrame=referenceFrame;
-  armed=false;
-  rearmAt=performance.now()+vals().cool;
+  if(running)beginCalibration(referenceFrame);
  }
  saving=false;
  if(navigator.vibrate) navigator.vibrate(40);
- say(`已记录 ${shots.length} 页 · 冷却后重新布防`);
+ say(`已记录 ${shots.length} 页 · 正在自动标定同页噪声…`);
  return true;
 }
 $('shot').onclick=()=>void saveFrame(grayFrame());
@@ -175,20 +168,21 @@ function loop(t,token){
   scheduleLoop(token);return;
  }
  const frameDelta=frameMetrics(cur,prev);
- if(!armed){
-  const wait=Math.max(0,rearmAt-t);
-  $('debug').textContent=`检测器 v4 · 拍后保护 · ${Math.ceil(wait/100)/10}s 后重新布防`;
-  // Rebuild the reference from the settled current page instead of keeping
-  // the single frame captured during a projector refresh or focus change.
-  if(t>=rearmAt && frameDelta.mean<v.stable*1.5){
-   lastPhotoFrame=cur;lastReferenceUpdate=t;armed=true;
-   say(`已记录 ${shots.length} 页 · 等待下一次翻页`);
+ if(calibrating){
+  if(t-lastCalibrationSample>=CALIBRATION_INTERVAL){
+   calibrationFrames.push(cur);lastCalibrationSample=t;
   }
+  const progress=Math.min(100,Math.round((t-calibrationStarted)*100/CALIBRATION_MS));
+  $('debug').textContent=`检测器 v5 · 自动标定 ${progress}% · 已采样 ${calibrationFrames.length} 帧`;
+  if(t-calibrationStarted>=CALIBRATION_MS&&calibrationFrames.length>=6)finishCalibration(t);
   prev=cur;scheduleLoop(token);return;
  }
+ if(!armed){prev=cur;scheduleLoop(token);return}
+ triggerThreshold=currentThreshold(v.change);
  const fromPhoto=frameMetrics(cur,lastPhotoFrame);
- const different=isPageChange(fromPhoto,v.change);
- $('debug').textContent=`检测器 v4 · 差异 ${fromPhoto.score.toFixed(1)} · 变化像素 ${fromPhoto.changedRatio.toFixed(2)}% · ${changing?'等待稳定':'已布防'}`;
+ const different=isPageChange(fromPhoto,triggerThreshold);
+ const stableLimit=Math.max(.55,noiseFloor*2.2+.2)*(0.75+v.stable*.08);
+ $('debug').textContent=`检测器 v5 · 差异 ${fromPhoto.score.toFixed(2)} / 门限 ${triggerThreshold.toFixed(2)} · 结构损失 ${fromPhoto.structureLoss.toFixed(1)}% · 边缘变化 ${fromPhoto.edgeChangedRatio.toFixed(1)}% · ${changing?'等待稳定':'已布防'}`;
 
  if(!changing && different && t-lastShot>v.cool){
   if(!changeSince)changeSince=t;
@@ -198,30 +192,36 @@ function loop(t,token){
   }
  }else if(!changing){
   changeSince=0;
-  // Track slow exposure/focus drift on the same slide. A real page change is
-  // never absorbed because updating stops as soon as the threshold is met.
-  if(t-lastReferenceUpdate>=1200){lastPhotoFrame=cur;lastReferenceUpdate=t}
+  // Only absorb very small same-page drift. The wide gap to the trigger
+  // threshold is hysteresis, so borderline noise cannot repeatedly toggle.
+  if(fromPhoto.score<triggerThreshold*.45&&t-lastReferenceUpdate>=1500){
+   lastPhotoFrame=PptDetector.blend(lastPhotoFrame,cur);lastReferenceUpdate=t;
+  }
  }
 
  if(changing){
+  if(fromPhoto.score<triggerThreshold*.55){
+   changing=false;stableSince=0;stableAnchor=null;changeStartedAt=0;
+   say('变化回落到同页范围 · 继续监测');
+  }
   let settled=false;
-  if(frameDelta.mean<v.stable){
+  if(changing&&frameDelta.score<stableLimit){
    if(!stableSince){stableSince=t;stableAnchor=cur}
    // A slow cross-fade may look unchanged between adjacent frames. Also
    // compare with the frame at the start of the stable window so cumulative
    // movement cannot be mistaken for a settled page.
    const drift=frameMetrics(cur,stableAnchor);
-   if(drift.mean>=v.stable || drift.changedRatio>=1.2){
+   if(drift.score>=stableLimit*1.35){
     stableSince=t;stableAnchor=cur;
    }
    settled=t-stableSince>=v.stableMs;
-  }else{stableSince=0;stableAnchor=null}
+  }else if(changing){stableSince=0;stableAnchor=null}
   // Some projectors flicker continuously and never look perfectly still to
   // the camera. Do not let that prevent a capture forever.
   const maxWaitReached=t-changeStartedAt>=Math.max(2500,v.stableMs+1600);
-  if(settled||maxWaitReached){
+  if(changing&&(settled||maxWaitReached)){
    const finalMetrics=frameMetrics(cur,lastPhotoFrame);
-   if(isPageChange(finalMetrics,v.change*.72)) void saveFrame(cur);
+   if(isPageChange(finalMetrics,triggerThreshold*.9)) void saveFrame(cur);
    else say('画面恢复为最近照片 · 未保存');
    changing=false;stableSince=0;stableAnchor=null;changeStartedAt=0;
   }
@@ -234,7 +234,7 @@ $('auto').onclick=()=>{
  running=!running;
  $('auto').textContent=running?'暂停自动记录':'开始自动记录';
  if(running){
-  runToken++;lastPhotoFrame=null;prev=null;changing=false;armed=false;
+  runToken++;lastPhotoFrame=null;prev=null;changing=false;armed=false;calibrating=false;calibrationFrames=[];
   stableSince=0;stableAnchor=null;changeSince=0;changeStartedAt=0;
   say('正在拍摄第一张参考照片…');loop(performance.now(),runToken);
  }else{

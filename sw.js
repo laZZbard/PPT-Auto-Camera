@@ -1,5 +1,5 @@
-const C='ppt-auto-camera-v4';
-const ASSETS=['./','./index.html','./manifest.webmanifest','./icon.svg'];
+const C='ppt-auto-camera-v5';
+const ASSETS=['./','./index.html','./detector.js','./manifest.webmanifest','./icon.svg'];
 self.addEventListener('install',e=>{
  self.skipWaiting();
  e.waitUntil(caches.open(C).then(c=>c.addAll(ASSETS)));
