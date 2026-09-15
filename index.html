@@ -35,21 +35,23 @@ input[type=range]{width:100%}.thumbs{display:grid;grid-template-columns:repeat(3
 <button class="secondary" id="export" disabled>导出本节照片</button>
 </div>
 <div class="settings">
-<label>变化阈值 <input id="change" type="range" min="5" max="40" value="16"><span id="changeV">16</span></label>
-<label>稳定阈值 <input id="stable" type="range" min="2" max="18" value="6"><span id="stableV">6</span></label>
+<label>变化阈值 <input id="change" type="range" min="3" max="20" value="6"><span id="changeV">6</span></label>
+<label>稳定阈值 <input id="stable" type="range" min="1" max="10" value="3"><span id="stableV">3</span></label>
 <label>稳定时间 <input id="stableMs" type="range" min="300" max="2000" step="100" value="800"><span id="stableMsV">0.8s</span></label>
 <label>冷却时间 <input id="coolMs" type="range" min="800" max="5000" step="200" value="1800"><span id="coolMsV">1.8s</span></label>
 </div>
-<div class="note">使用时保持页面在前台、屏幕不要锁定，并尽量把手机固定。白框中央区域用于检测；保存的是当前相机视频流的高分辨率帧，不等同于 iPhone 原生“照片”模式的完整计算摄影质量。</div>
+<div class="note">使用时保持页面在前台、屏幕不要锁定，并尽量把手机固定。检测会忽略投影亮度整体波动，并同时观察显著变化像素占比，文字较少的翻页也更容易触发。阈值越低越灵敏；保存的是当前相机视频流的高分辨率帧。</div>
 <div class="thumbs" id="thumbs"></div>
-<canvas id="work" width="160" height="90" hidden></canvas>
+<canvas id="work" width="192" height="108" hidden></canvas>
 <canvas id="capture" hidden></canvas>
 </main>
 <script>
 const $=id=>document.getElementById(id);
 const video=$('video'), work=$('work'), wctx=work.getContext('2d',{willReadFrequently:true});
 const capture=$('capture'), cctx=capture.getContext('2d');
-let stream=null, running=false, ref=null, prev=null, changing=false, stableSince=0, lastShot=0, raf=0;
+const DETECT_W=192, DETECT_H=108, PIXEL_DELTA=14, CHANGE_CONFIRM_MS=240;
+let stream=null, running=false, ref=null, prev=null, changing=false;
+let stableSince=0, stableAnchor=null, changeSince=0, lastShot=0, lastStatus=0, raf=0;
 let shots=[];
 
 function say(s){$('status').textContent=s}
@@ -77,29 +79,63 @@ async function startCamera(){
 $('camera').onclick=startCamera;
 
 function grayFrame(){
- const W=160,H=90;
- // detect central 84% x 65%, matching overlay approximately
  const vw=video.videoWidth,vh=video.videoHeight;
  const sx=vw*.08, sy=vh*.10, sw=vw*.84, sh=vh*.65;
- wctx.drawImage(video,sx,sy,sw,sh,0,0,W,H);
- const d=wctx.getImageData(0,0,W,H).data, a=new Uint8Array(W*H);
+ wctx.drawImage(video,sx,sy,sw,sh,0,0,DETECT_W,DETECT_H);
+ const d=wctx.getImageData(0,0,DETECT_W,DETECT_H).data;
+ const a=new Uint8Array(DETECT_W*DETECT_H);
  for(let i=0,j=0;i<d.length;i+=4,j++) a[j]=(d[i]*3+d[i+1]*6+d[i+2])/10;
  return a;
 }
-function diff(a,b){
- if(!a||!b)return 0; let sum=0;
- for(let i=0;i<a.length;i++) sum+=Math.abs(a[i]-b[i]);
- return sum/a.length;
+
+// Compensate for a global brightness shift, then combine average structural
+// difference with the percentage of pixels that changed significantly. A
+// small changed text region is therefore not diluted by a large plain slide.
+function frameMetrics(a,b){
+ if(!a||!b)return {mean:0,changedRatio:0,strongRatio:0,score:0};
+ let signed=0;
+ for(let i=0;i<a.length;i++) signed+=a[i]-b[i];
+ const brightnessShift=signed/a.length;
+ let sum=0, changed=0, strong=0;
+ for(let i=0;i<a.length;i++){
+  const delta=Math.abs((a[i]-b[i])-brightnessShift);
+  sum+=delta;
+  if(delta>=PIXEL_DELTA)changed++;
+  if(delta>=32)strong++;
+ }
+ const mean=sum/a.length;
+ const changedRatio=changed*100/a.length;
+ const strongRatio=strong*100/a.length;
+ return {mean,changedRatio,strongRatio,
+  score:mean+changedRatio*2.3+strongRatio*.7};
 }
+
+function isPageChange(metrics,threshold){
+ // The ratio path catches slides where only a line or title changed.
+ return metrics.score>=threshold || metrics.changedRatio>=Math.max(1.2,threshold*.24);
+}
+
+function detectorSelfTest(){
+ const base=new Uint8Array(1000).fill(80);
+ const brighter=new Uint8Array(1000).fill(92);
+ const textChange=new Uint8Array(base);
+ for(let i=0;i<20;i++)textChange[i]=180;
+ const brightnessIgnored=frameMetrics(brighter,base).score<.01;
+ const smallTextDetected=isPageChange(frameMetrics(textChange,base),6);
+ return brightnessIgnored&&smallTextDetected;
+}
+
 async function saveFrame(){
  if(!video.videoWidth)return;
+ lastShot=performance.now();
  capture.width=video.videoWidth;capture.height=video.videoHeight;
  cctx.drawImage(video,0,0,capture.width,capture.height);
  const blob=await new Promise(r=>capture.toBlob(r,'image/jpeg',0.95));
+ if(!blob){say('保存失败 · 请手动保存');return}
  const url=URL.createObjectURL(blob);
  shots.push({blob,url,name:`PPT_${String(shots.length+1).padStart(3,'0')}.jpg`});
  const img=new Image();img.src=url;$('thumbs').prepend(img);
- $('export').disabled=false; lastShot=performance.now();
+ $('export').disabled=false;
  if(navigator.vibrate) navigator.vibrate(40);
  say(`已记录 ${shots.length} 页 · 等待翻页`);
 }
@@ -108,41 +144,76 @@ $('shot').onclick=saveFrame;
 function loop(t){
  if(!running)return;
  const cur=grayFrame(), v=vals();
- if(!ref){ref=cur;prev=cur;say('已建立参考页 · 等待翻页');raf=requestAnimationFrame(loop);return}
- const fromRef=diff(cur,ref), frameDiff=diff(cur,prev);
- if(!changing && fromRef>v.change && t-lastShot>v.cool){
-   changing=true;stableSince=0;say('检测到变化 · 等待新页面稳定…');
+ if(!ref){
+  ref=cur;prev=cur;changeSince=0;
+  say('已建立参考页 · 等待翻页');
+  raf=requestAnimationFrame(loop);return;
  }
+ const fromRef=frameMetrics(cur,ref);
+ const frameDelta=frameMetrics(cur,prev);
+ const different=isPageChange(fromRef,v.change);
+
+ if(!changing && different && t-lastShot>v.cool){
+  if(!changeSince)changeSince=t;
+  if(t-changeSince>=CHANGE_CONFIRM_MS){
+   changing=true;stableSince=0;stableAnchor=null;changeSince=0;
+   say(`检测到变化 ${fromRef.score.toFixed(1)} · 等待新页面稳定…`);
+  }
+ }else if(!changing){
+  changeSince=0;
+  if(t-lastStatus>700){
+   say(`等待翻页 · 变化分数 ${fromRef.score.toFixed(1)}`);
+   lastStatus=t;
+  }
+ }
+
  if(changing){
-   if(frameDiff<v.stable){
-     if(!stableSince)stableSince=t;
-     if(t-stableSince>=v.stableMs){
-       // If it returned close to reference, treat as obstruction/temporary motion.
-       if(diff(cur,ref)>v.change*.75){
-         saveFrame(); ref=cur;
-       } else say('画面恢复原页 · 未保存');
-       changing=false;stableSince=0;
-     }
-   } else stableSince=0;
+  if(frameDelta.mean<v.stable){
+   if(!stableSince){stableSince=t;stableAnchor=cur}
+   // A slow cross-fade may look unchanged between adjacent frames. Also
+   // compare with the frame at the start of the stable window so cumulative
+   // movement cannot be mistaken for a settled page.
+   const drift=frameMetrics(cur,stableAnchor);
+   if(drift.mean>=v.stable || drift.changedRatio>=1.2){
+    stableSince=t;stableAnchor=cur;
+   }
+   if(t-stableSince>=v.stableMs){
+    const finalMetrics=frameMetrics(cur,ref);
+    if(isPageChange(finalMetrics,v.change*.72)){
+     ref=cur;
+     void saveFrame();
+    }else say('画面恢复原页 · 未保存');
+    changing=false;stableSince=0;stableAnchor=null;
+   }
+  }else{stableSince=0;stableAnchor=null}
  }
- prev=cur; setTimeout(()=>raf=requestAnimationFrame(loop),120);
+ prev=cur;
+ setTimeout(()=>raf=requestAnimationFrame(loop),80);
 }
+
 $('auto').onclick=()=>{
  running=!running;
  $('auto').textContent=running?'暂停自动记录':'开始自动记录';
- if(running){ref=null;prev=null;changing=false;say('正在初始化参考页…');loop(performance.now())}
- else{cancelAnimationFrame(raf);say('自动记录已暂停')}
+ if(running){
+  ref=null;prev=null;changing=false;stableSince=0;stableAnchor=null;changeSince=0;
+  say('正在初始化参考页…');loop(performance.now());
+ }else{cancelAnimationFrame(raf);say('自动记录已暂停')}
 };
 
 $('export').onclick=async()=>{
- // iOS permits reliable user-initiated downloads; trigger sequentially.
  for(const s of shots){
-   const a=document.createElement('a');a.href=s.url;a.download=s.name;
-   document.body.appendChild(a);a.click();a.remove();
-   await new Promise(r=>setTimeout(r,250));
+  const a=document.createElement('a');a.href=s.url;a.download=s.name;
+  document.body.appendChild(a);a.click();a.remove();
+  await new Promise(r=>setTimeout(r,250));
  }
  say(`已请求导出 ${shots.length} 张照片`);
 };
 
+document.documentElement.dataset.appReady='true';
+if(new URLSearchParams(location.search).has('selftest')){
+ const passed=detectorSelfTest();
+ document.documentElement.dataset.detectorSelftest=passed?'pass':'fail';
+ say(`检测自测：${passed?'通过':'失败'}`);
+}
 if('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(()=>{});
 </script></body></html>
