@@ -31,20 +31,22 @@ class DetectionModelTests(unittest.TestCase):
         reference = [80] * 1000
         changed = reference.copy()
         changed[:20] = [180] * 20
-        self.assertTrue(is_page_change(frame_metrics(changed, reference), 3))
+        self.assertTrue(is_page_change(frame_metrics(changed, reference), 5))
 
     def test_low_level_sensor_noise_is_ignored(self):
         reference = [80] * 1000
         noisy = [78 if i % 2 else 82 for i in range(1000)]
-        self.assertFalse(is_page_change(frame_metrics(noisy, reference), 3))
+        self.assertFalse(is_page_change(frame_metrics(noisy, reference), 5))
 
-    def test_html_is_parseable_and_uses_v3_cache(self):
+    def test_html_is_parseable_and_uses_v4_cache(self):
         root = Path(__file__).parents[1]
         html = (root / "index.html").read_text(encoding="utf-8")
         HTMLParser().feed(html)
         self.assertIn("detectorSelfTest()", html)
         self.assertIn("lastPhotoFrame=referenceFrame", html)
-        self.assertIn("ppt-auto-camera-v3", (root / "sw.js").read_text(encoding="utf-8"))
+        self.assertIn("armed=false", html)
+        self.assertIn("rearmAt=performance.now()+vals().cool", html)
+        self.assertIn("ppt-auto-camera-v4", (root / "sw.js").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

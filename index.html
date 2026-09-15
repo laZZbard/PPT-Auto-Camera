@@ -28,7 +28,7 @@ input[type=range]{width:100%}.thumbs{display:grid;grid-template-columns:repeat(3
 <h1>PPT 自动相机</h1>
 <div class="stage"><video id="video" playsinline autoplay muted></video><div class="roi"></div></div>
 <div class="status" id="status">先启动相机</div>
-<div class="debug" id="debug">检测器 v3 · 最近照片对比模式</div>
+<div class="debug" id="debug">检测器 v4 · 单页防重复模式</div>
 <div class="controls">
 <button class="primary" id="camera">启动相机</button>
 <button class="secondary" id="auto" disabled>开始自动记录</button>
@@ -36,12 +36,12 @@ input[type=range]{width:100%}.thumbs{display:grid;grid-template-columns:repeat(3
 <button class="secondary" id="export" disabled>导出本节照片</button>
 </div>
 <div class="settings">
-<label>差异阈值 <input id="change" type="range" min="1" max="12" value="3"><span id="changeV">3</span></label>
+<label>差异阈值 <input id="change" type="range" min="2" max="12" value="5"><span id="changeV">5</span></label>
 <label>稳定阈值 <input id="stable" type="range" min="1" max="12" value="5"><span id="stableV">5</span></label>
 <label>稳定时间 <input id="stableMs" type="range" min="300" max="2000" step="100" value="800"><span id="stableMsV">0.8s</span></label>
 <label>冷却时间 <input id="coolMs" type="range" min="800" max="5000" step="200" value="1800"><span id="coolMsV">1.8s</span></label>
 </div>
-<div class="note">开始自动记录后会先保存当前页。此后实时画面始终与最近一次成功拍摄的照片画面比较；内容不一致并重新稳定后就拍照。算法会忽略整体亮度波动和轻微传感器噪声，差异阈值越低越灵敏。</div>
+<div class="note">开始后先保存当前页。每次拍照后，程序会等待冷却并在当前页稳定时重新建立基准，之后才允许拍摄下一页，以避免同一页重复拍摄。差异阈值越低越灵敏。</div>
 <div class="thumbs" id="thumbs"></div>
 <canvas id="work" width="192" height="108" hidden></canvas>
 <canvas id="capture" hidden></canvas>
@@ -50,10 +50,10 @@ input[type=range]{width:100%}.thumbs{display:grid;grid-template-columns:repeat(3
 const $=id=>document.getElementById(id);
 const video=$('video'), work=$('work'), wctx=work.getContext('2d',{willReadFrequently:true});
 const capture=$('capture'), cctx=capture.getContext('2d');
-const DETECT_W=192, DETECT_H=108, PIXEL_DELTA=10, CHANGE_CONFIRM_MS=160;
-let stream=null, running=false, lastPhotoFrame=null, prev=null, changing=false, saving=false;
+const DETECT_W=192, DETECT_H=108, PIXEL_DELTA=10, CHANGE_CONFIRM_MS=420;
+let stream=null, running=false, lastPhotoFrame=null, prev=null, changing=false, saving=false, armed=false;
 let stableSince=0, stableAnchor=null, changeSince=0, changeStartedAt=0;
-let lastShot=0, raf=0, timer=0, runToken=0;
+let lastShot=0, rearmAt=0, lastReferenceUpdate=0, raf=0, timer=0, runToken=0;
 let shots=[];
 
 function say(s){$('status').textContent=s}
@@ -124,7 +124,7 @@ function frameMetrics(a,b){
 function isPageChange(metrics,threshold){
  // Even a small changed text area should trigger, while sub-threshold camera
  // noise and uniform projector brightness shifts are ignored.
- return metrics.score>=threshold || metrics.changedRatio>=Math.max(.35,threshold*.12);
+ return metrics.score>=threshold || metrics.changedRatio>=Math.max(.8,threshold*.18);
 }
 
 function detectorSelfTest(){
@@ -133,7 +133,7 @@ function detectorSelfTest(){
  const textChange=new Uint8Array(base);
  for(let i=0;i<20;i++)textChange[i]=180;
  const brightnessIgnored=frameMetrics(brighter,base).score<.01;
- const smallTextDetected=isPageChange(frameMetrics(textChange,base),3);
+ const smallTextDetected=isPageChange(frameMetrics(textChange,base),5);
  return brightnessIgnored&&smallTextDetected;
 }
 
@@ -150,10 +150,14 @@ async function saveFrame(referenceFrame=grayFrame()){
  shots.push({blob,url,name:`PPT_${String(shots.length+1).padStart(3,'0')}.jpg`});
  const img=new Image();img.src=url;$('thumbs').prepend(img);
  $('export').disabled=false;
- if(saveToken===runToken)lastPhotoFrame=referenceFrame;
+ if(saveToken===runToken){
+  lastPhotoFrame=referenceFrame;
+  armed=false;
+  rearmAt=performance.now()+vals().cool;
+ }
  saving=false;
  if(navigator.vibrate) navigator.vibrate(40);
- say(`已记录 ${shots.length} 页 · 与最近照片对比中`);
+ say(`已记录 ${shots.length} 页 · 冷却后重新布防`);
  return true;
 }
 $('shot').onclick=()=>void saveFrame(grayFrame());
@@ -170,10 +174,21 @@ function loop(t,token){
   if(!saving){say('正在保存第一张作为对比基准…');void saveFrame(cur)}
   scheduleLoop(token);return;
  }
- const fromPhoto=frameMetrics(cur,lastPhotoFrame);
  const frameDelta=frameMetrics(cur,prev);
+ if(!armed){
+  const wait=Math.max(0,rearmAt-t);
+  $('debug').textContent=`检测器 v4 · 拍后保护 · ${Math.ceil(wait/100)/10}s 后重新布防`;
+  // Rebuild the reference from the settled current page instead of keeping
+  // the single frame captured during a projector refresh or focus change.
+  if(t>=rearmAt && frameDelta.mean<v.stable*1.5){
+   lastPhotoFrame=cur;lastReferenceUpdate=t;armed=true;
+   say(`已记录 ${shots.length} 页 · 等待下一次翻页`);
+  }
+  prev=cur;scheduleLoop(token);return;
+ }
+ const fromPhoto=frameMetrics(cur,lastPhotoFrame);
  const different=isPageChange(fromPhoto,v.change);
- $('debug').textContent=`检测器 v3 · 与最近照片差异 ${fromPhoto.score.toFixed(1)} · 变化像素 ${fromPhoto.changedRatio.toFixed(2)}% · ${changing?'等待稳定':'监测中'}`;
+ $('debug').textContent=`检测器 v4 · 差异 ${fromPhoto.score.toFixed(1)} · 变化像素 ${fromPhoto.changedRatio.toFixed(2)}% · ${changing?'等待稳定':'已布防'}`;
 
  if(!changing && different && t-lastShot>v.cool){
   if(!changeSince)changeSince=t;
@@ -183,6 +198,9 @@ function loop(t,token){
   }
  }else if(!changing){
   changeSince=0;
+  // Track slow exposure/focus drift on the same slide. A real page change is
+  // never absorbed because updating stops as soon as the threshold is met.
+  if(t-lastReferenceUpdate>=1200){lastPhotoFrame=cur;lastReferenceUpdate=t}
  }
 
  if(changing){
@@ -216,7 +234,7 @@ $('auto').onclick=()=>{
  running=!running;
  $('auto').textContent=running?'暂停自动记录':'开始自动记录';
  if(running){
-  runToken++;lastPhotoFrame=null;prev=null;changing=false;
+  runToken++;lastPhotoFrame=null;prev=null;changing=false;armed=false;
   stableSince=0;stableAnchor=null;changeSince=0;changeStartedAt=0;
   say('正在拍摄第一张参考照片…');loop(performance.now(),runToken);
  }else{
