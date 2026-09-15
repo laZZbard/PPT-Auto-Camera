@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#111111">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon.svg">
+<title>PPT 自动相机</title>
+<style>
+:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color-scheme:dark}
+*{box-sizing:border-box} body{margin:0;background:#000;color:#fff}
+main{max-width:900px;margin:auto;padding:env(safe-area-inset-top) 12px env(safe-area-inset-bottom)}
+h1{font-size:20px;margin:12px 0}.stage{position:relative;background:#111;border-radius:14px;overflow:hidden}
+video{display:block;width:100%;max-height:65vh;object-fit:contain;background:#000}
+.roi{position:absolute;left:8%;top:10%;width:84%;height:65%;border:2px solid #fff;border-radius:8px;box-shadow:0 0 0 9999px #0005;pointer-events:none}
+.status{padding:10px 2px;font-weight:600}.controls{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+button{border:0;border-radius:12px;padding:13px;font-size:16px;font-weight:650}
+.primary{background:#fff;color:#000}.secondary{background:#2c2c2e;color:#fff}
+.settings{margin-top:12px;padding:12px;background:#1c1c1e;border-radius:14px}
+label{display:grid;grid-template-columns:130px 1fr 48px;gap:8px;align-items:center;margin:9px 0;font-size:14px}
+input[type=range]{width:100%}.thumbs{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:12px}
+.thumbs img{width:100%;aspect-ratio:4/3;object-fit:cover;border-radius:7px}
+.note{font-size:12px;color:#aaa;line-height:1.4;margin:10px 2px}
+</style>
+</head>
+<body><main>
+<h1>PPT 自动相机</h1>
+<div class="stage"><video id="video" playsinline autoplay muted></video><div class="roi"></div></div>
+<div class="status" id="status">先启动相机</div>
+<div class="controls">
+<button class="primary" id="camera">启动相机</button>
+<button class="secondary" id="auto" disabled>开始自动记录</button>
+<button class="secondary" id="shot" disabled>手动保存</button>
+<button class="secondary" id="export" disabled>导出本节照片</button>
+</div>
+<div class="settings">
+<label>变化阈值 <input id="change" type="range" min="5" max="40" value="16"><span id="changeV">16</span></label>
+<label>稳定阈值 <input id="stable" type="range" min="2" max="18" value="6"><span id="stableV">6</span></label>
+<label>稳定时间 <input id="stableMs" type="range" min="300" max="2000" step="100" value="800"><span id="stableMsV">0.8s</span></label>
+<label>冷却时间 <input id="coolMs" type="range" min="800" max="5000" step="200" value="1800"><span id="coolMsV">1.8s</span></label>
+</div>
+<div class="note">使用时保持页面在前台、屏幕不要锁定，并尽量把手机固定。白框中央区域用于检测；保存的是当前相机视频流的高分辨率帧，不等同于 iPhone 原生“照片”模式的完整计算摄影质量。</div>
+<div class="thumbs" id="thumbs"></div>
+<canvas id="work" width="160" height="90" hidden></canvas>
+<canvas id="capture" hidden></canvas>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const video=$('video'), work=$('work'), wctx=work.getContext('2d',{willReadFrequently:true});
+const capture=$('capture'), cctx=capture.getContext('2d');
+let stream=null, running=false, ref=null, prev=null, changing=false, stableSince=0, lastShot=0, raf=0;
+let shots=[];
+
+function say(s){$('status').textContent=s}
+function vals(){
+ return {change:+$('change').value, stable:+$('stable').value,
+ stableMs:+$('stableMs').value, cool:+$('coolMs').value}
+}
+for(const id of ['change','stable','stableMs','coolMs']) $(id).oninput=()=>{
+ $('changeV').textContent=$('change').value;
+ $('stableV').textContent=$('stable').value;
+ $('stableMsV').textContent=(+$('stableMs').value/1000).toFixed(1)+'s';
+ $('coolMsV').textContent=(+$('coolMs').value/1000).toFixed(1)+'s';
+};
+
+async function startCamera(){
+ try{
+  stream=await navigator.mediaDevices.getUserMedia({
+   video:{facingMode:{ideal:'environment'},width:{ideal:3840},height:{ideal:2160}},audio:false
+  });
+  video.srcObject=stream; await video.play();
+  $('auto').disabled=false;$('shot').disabled=false;
+  say('相机已启动 · 对准 PPT 后开始自动记录');
+ }catch(e){say('无法打开相机：'+e.message)}
+}
+$('camera').onclick=startCamera;
+
+function grayFrame(){
+ const W=160,H=90;
+ // detect central 84% x 65%, matching overlay approximately
+ const vw=video.videoWidth,vh=video.videoHeight;
+ const sx=vw*.08, sy=vh*.10, sw=vw*.84, sh=vh*.65;
+ wctx.drawImage(video,sx,sy,sw,sh,0,0,W,H);
+ const d=wctx.getImageData(0,0,W,H).data, a=new Uint8Array(W*H);
+ for(let i=0,j=0;i<d.length;i+=4,j++) a[j]=(d[i]*3+d[i+1]*6+d[i+2])/10;
+ return a;
+}
+function diff(a,b){
+ if(!a||!b)return 0; let sum=0;
+ for(let i=0;i<a.length;i++) sum+=Math.abs(a[i]-b[i]);
+ return sum/a.length;
+}
+async function saveFrame(){
+ if(!video.videoWidth)return;
+ capture.width=video.videoWidth;capture.height=video.videoHeight;
+ cctx.drawImage(video,0,0,capture.width,capture.height);
+ const blob=await new Promise(r=>capture.toBlob(r,'image/jpeg',0.95));
+ const url=URL.createObjectURL(blob);
+ shots.push({blob,url,name:`PPT_${String(shots.length+1).padStart(3,'0')}.jpg`});
+ const img=new Image();img.src=url;$('thumbs').prepend(img);
+ $('export').disabled=false; lastShot=performance.now();
+ if(navigator.vibrate) navigator.vibrate(40);
+ say(`已记录 ${shots.length} 页 · 等待翻页`);
+}
+$('shot').onclick=saveFrame;
+
+function loop(t){
+ if(!running)return;
+ const cur=grayFrame(), v=vals();
+ if(!ref){ref=cur;prev=cur;say('已建立参考页 · 等待翻页');raf=requestAnimationFrame(loop);return}
+ const fromRef=diff(cur,ref), frameDiff=diff(cur,prev);
+ if(!changing && fromRef>v.change && t-lastShot>v.cool){
+   changing=true;stableSince=0;say('检测到变化 · 等待新页面稳定…');
+ }
+ if(changing){
+   if(frameDiff<v.stable){
+     if(!stableSince)stableSince=t;
+     if(t-stableSince>=v.stableMs){
+       // If it returned close to reference, treat as obstruction/temporary motion.
+       if(diff(cur,ref)>v.change*.75){
+         saveFrame(); ref=cur;
+       } else say('画面恢复原页 · 未保存');
+       changing=false;stableSince=0;
+     }
+   } else stableSince=0;
+ }
+ prev=cur; setTimeout(()=>raf=requestAnimationFrame(loop),120);
+}
+$('auto').onclick=()=>{
+ running=!running;
+ $('auto').textContent=running?'暂停自动记录':'开始自动记录';
+ if(running){ref=null;prev=null;changing=false;say('正在初始化参考页…');loop(performance.now())}
+ else{cancelAnimationFrame(raf);say('自动记录已暂停')}
+};
+
+$('export').onclick=async()=>{
+ // iOS permits reliable user-initiated downloads; trigger sequentially.
+ for(const s of shots){
+   const a=document.createElement('a');a.href=s.url;a.download=s.name;
+   document.body.appendChild(a);a.click();a.remove();
+   await new Promise(r=>setTimeout(r,250));
+ }
+ say(`已请求导出 ${shots.length} 张照片`);
+};
+
+if('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(()=>{});
+</script></body></html>
