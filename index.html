@@ -14,7 +14,7 @@ main{max-width:900px;margin:auto;padding:env(safe-area-inset-top) 12px env(safe-
 h1{font-size:20px;margin:12px 0}.stage{position:relative;background:#111;border-radius:14px;overflow:hidden}
 video{display:block;width:100%;max-height:65vh;object-fit:contain;background:#000}
 .roi{position:absolute;left:8%;top:10%;width:84%;height:65%;border:2px solid #fff;border-radius:8px;box-shadow:0 0 0 9999px #0005;pointer-events:none}
-.status{padding:10px 2px;font-weight:600}.controls{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.status{padding:10px 2px 3px;font-weight:600}.debug{padding:0 2px 9px;color:#9aa0a6;font-size:12px}.controls{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 button{border:0;border-radius:12px;padding:13px;font-size:16px;font-weight:650}
 .primary{background:#fff;color:#000}.secondary{background:#2c2c2e;color:#fff}
 .settings{margin-top:12px;padding:12px;background:#1c1c1e;border-radius:14px}
@@ -28,6 +28,7 @@ input[type=range]{width:100%}.thumbs{display:grid;grid-template-columns:repeat(3
 <h1>PPT 自动相机</h1>
 <div class="stage"><video id="video" playsinline autoplay muted></video><div class="roi"></div></div>
 <div class="status" id="status">先启动相机</div>
+<div class="debug" id="debug">检测器 v3 · 最近照片对比模式</div>
 <div class="controls">
 <button class="primary" id="camera">启动相机</button>
 <button class="secondary" id="auto" disabled>开始自动记录</button>
@@ -35,12 +36,12 @@ input[type=range]{width:100%}.thumbs{display:grid;grid-template-columns:repeat(3
 <button class="secondary" id="export" disabled>导出本节照片</button>
 </div>
 <div class="settings">
-<label>变化阈值 <input id="change" type="range" min="3" max="20" value="6"><span id="changeV">6</span></label>
-<label>稳定阈值 <input id="stable" type="range" min="1" max="10" value="3"><span id="stableV">3</span></label>
+<label>差异阈值 <input id="change" type="range" min="1" max="12" value="3"><span id="changeV">3</span></label>
+<label>稳定阈值 <input id="stable" type="range" min="1" max="12" value="5"><span id="stableV">5</span></label>
 <label>稳定时间 <input id="stableMs" type="range" min="300" max="2000" step="100" value="800"><span id="stableMsV">0.8s</span></label>
 <label>冷却时间 <input id="coolMs" type="range" min="800" max="5000" step="200" value="1800"><span id="coolMsV">1.8s</span></label>
 </div>
-<div class="note">使用时保持页面在前台、屏幕不要锁定，并尽量把手机固定。检测会忽略投影亮度整体波动，并同时观察显著变化像素占比，文字较少的翻页也更容易触发。阈值越低越灵敏；保存的是当前相机视频流的高分辨率帧。</div>
+<div class="note">开始自动记录后会先保存当前页。此后实时画面始终与最近一次成功拍摄的照片画面比较；内容不一致并重新稳定后就拍照。算法会忽略整体亮度波动和轻微传感器噪声，差异阈值越低越灵敏。</div>
 <div class="thumbs" id="thumbs"></div>
 <canvas id="work" width="192" height="108" hidden></canvas>
 <canvas id="capture" hidden></canvas>
@@ -49,9 +50,10 @@ input[type=range]{width:100%}.thumbs{display:grid;grid-template-columns:repeat(3
 const $=id=>document.getElementById(id);
 const video=$('video'), work=$('work'), wctx=work.getContext('2d',{willReadFrequently:true});
 const capture=$('capture'), cctx=capture.getContext('2d');
-const DETECT_W=192, DETECT_H=108, PIXEL_DELTA=14, CHANGE_CONFIRM_MS=240;
-let stream=null, running=false, ref=null, prev=null, changing=false;
-let stableSince=0, stableAnchor=null, changeSince=0, lastShot=0, lastStatus=0, raf=0;
+const DETECT_W=192, DETECT_H=108, PIXEL_DELTA=10, CHANGE_CONFIRM_MS=160;
+let stream=null, running=false, lastPhotoFrame=null, prev=null, changing=false, saving=false;
+let stableSince=0, stableAnchor=null, changeSince=0, changeStartedAt=0;
+let lastShot=0, raf=0, timer=0, runToken=0;
 let shots=[];
 
 function say(s){$('status').textContent=s}
@@ -92,27 +94,37 @@ function grayFrame(){
 // difference with the percentage of pixels that changed significantly. A
 // small changed text region is therefore not diluted by a large plain slide.
 function frameMetrics(a,b){
- if(!a||!b)return {mean:0,changedRatio:0,strongRatio:0,score:0};
+ if(!a||!b)return {mean:0,changedRatio:0,strongRatio:0,topMean:0,score:0};
  let signed=0;
  for(let i=0;i<a.length;i++) signed+=a[i]-b[i];
  const brightnessShift=signed/a.length;
  let sum=0, changed=0, strong=0;
+ const histogram=new Uint16Array(256);
  for(let i=0;i<a.length;i++){
   const delta=Math.abs((a[i]-b[i])-brightnessShift);
   sum+=delta;
+  histogram[Math.min(255,Math.floor(delta))]++;
   if(delta>=PIXEL_DELTA)changed++;
-  if(delta>=32)strong++;
+  if(delta>=24)strong++;
  }
  const mean=sum/a.length;
  const changedRatio=changed*100/a.length;
  const strongRatio=strong*100/a.length;
- return {mean,changedRatio,strongRatio,
-  score:mean+changedRatio*2.3+strongRatio*.7};
+ const topCount=Math.max(1,Math.floor(a.length*.02));
+ let remaining=topCount,topSum=0;
+ for(let value=255;value>=0&&remaining;value--){
+  const take=Math.min(remaining,histogram[value]);
+  topSum+=take*value;remaining-=take;
+ }
+ const topMean=topSum/topCount;
+ return {mean,changedRatio,strongRatio,topMean,
+  score:mean+changedRatio*1.6+strongRatio*1.2+topMean*.08};
 }
 
 function isPageChange(metrics,threshold){
- // The ratio path catches slides where only a line or title changed.
- return metrics.score>=threshold || metrics.changedRatio>=Math.max(1.2,threshold*.24);
+ // Even a small changed text area should trigger, while sub-threshold camera
+ // noise and uniform projector brightness shifts are ignored.
+ return metrics.score>=threshold || metrics.changedRatio>=Math.max(.35,threshold*.12);
 }
 
 function detectorSelfTest(){
@@ -121,53 +133,60 @@ function detectorSelfTest(){
  const textChange=new Uint8Array(base);
  for(let i=0;i<20;i++)textChange[i]=180;
  const brightnessIgnored=frameMetrics(brighter,base).score<.01;
- const smallTextDetected=isPageChange(frameMetrics(textChange,base),6);
+ const smallTextDetected=isPageChange(frameMetrics(textChange,base),3);
  return brightnessIgnored&&smallTextDetected;
 }
 
-async function saveFrame(){
- if(!video.videoWidth)return;
+async function saveFrame(referenceFrame=grayFrame()){
+ if(!video.videoWidth||saving)return false;
+ const saveToken=runToken;
+ saving=true;
  lastShot=performance.now();
  capture.width=video.videoWidth;capture.height=video.videoHeight;
  cctx.drawImage(video,0,0,capture.width,capture.height);
  const blob=await new Promise(r=>capture.toBlob(r,'image/jpeg',0.95));
- if(!blob){say('保存失败 · 请手动保存');return}
+ if(!blob){saving=false;say('保存失败 · 请手动保存');return false}
  const url=URL.createObjectURL(blob);
  shots.push({blob,url,name:`PPT_${String(shots.length+1).padStart(3,'0')}.jpg`});
  const img=new Image();img.src=url;$('thumbs').prepend(img);
  $('export').disabled=false;
+ if(saveToken===runToken)lastPhotoFrame=referenceFrame;
+ saving=false;
  if(navigator.vibrate) navigator.vibrate(40);
- say(`已记录 ${shots.length} 页 · 等待翻页`);
+ say(`已记录 ${shots.length} 页 · 与最近照片对比中`);
+ return true;
 }
-$('shot').onclick=saveFrame;
+$('shot').onclick=()=>void saveFrame(grayFrame());
 
-function loop(t){
- if(!running)return;
+function scheduleLoop(token){
+ timer=setTimeout(()=>raf=requestAnimationFrame(t=>loop(t,token)),80);
+}
+
+function loop(t,token){
+ if(!running||token!==runToken)return;
  const cur=grayFrame(), v=vals();
- if(!ref){
-  ref=cur;prev=cur;changeSince=0;
-  say('已建立参考页 · 等待翻页');
-  raf=requestAnimationFrame(loop);return;
+ if(!lastPhotoFrame){
+  prev=cur;changeSince=0;
+  if(!saving){say('正在保存第一张作为对比基准…');void saveFrame(cur)}
+  scheduleLoop(token);return;
  }
- const fromRef=frameMetrics(cur,ref);
+ const fromPhoto=frameMetrics(cur,lastPhotoFrame);
  const frameDelta=frameMetrics(cur,prev);
- const different=isPageChange(fromRef,v.change);
+ const different=isPageChange(fromPhoto,v.change);
+ $('debug').textContent=`检测器 v3 · 与最近照片差异 ${fromPhoto.score.toFixed(1)} · 变化像素 ${fromPhoto.changedRatio.toFixed(2)}% · ${changing?'等待稳定':'监测中'}`;
 
  if(!changing && different && t-lastShot>v.cool){
   if(!changeSince)changeSince=t;
   if(t-changeSince>=CHANGE_CONFIRM_MS){
-   changing=true;stableSince=0;stableAnchor=null;changeSince=0;
-   say(`检测到变化 ${fromRef.score.toFixed(1)} · 等待新页面稳定…`);
+   changing=true;changeStartedAt=t;stableSince=0;stableAnchor=null;changeSince=0;
+   say(`内容与最近照片不一致 · 等待画面稳定…`);
   }
  }else if(!changing){
   changeSince=0;
-  if(t-lastStatus>700){
-   say(`等待翻页 · 变化分数 ${fromRef.score.toFixed(1)}`);
-   lastStatus=t;
-  }
  }
 
  if(changing){
+  let settled=false;
   if(frameDelta.mean<v.stable){
    if(!stableSince){stableSince=t;stableAnchor=cur}
    // A slow cross-fade may look unchanged between adjacent frames. Also
@@ -177,27 +196,32 @@ function loop(t){
    if(drift.mean>=v.stable || drift.changedRatio>=1.2){
     stableSince=t;stableAnchor=cur;
    }
-   if(t-stableSince>=v.stableMs){
-    const finalMetrics=frameMetrics(cur,ref);
-    if(isPageChange(finalMetrics,v.change*.72)){
-     ref=cur;
-     void saveFrame();
-    }else say('画面恢复原页 · 未保存');
-    changing=false;stableSince=0;stableAnchor=null;
-   }
+   settled=t-stableSince>=v.stableMs;
   }else{stableSince=0;stableAnchor=null}
+  // Some projectors flicker continuously and never look perfectly still to
+  // the camera. Do not let that prevent a capture forever.
+  const maxWaitReached=t-changeStartedAt>=Math.max(2500,v.stableMs+1600);
+  if(settled||maxWaitReached){
+   const finalMetrics=frameMetrics(cur,lastPhotoFrame);
+   if(isPageChange(finalMetrics,v.change*.72)) void saveFrame(cur);
+   else say('画面恢复为最近照片 · 未保存');
+   changing=false;stableSince=0;stableAnchor=null;changeStartedAt=0;
+  }
  }
  prev=cur;
- setTimeout(()=>raf=requestAnimationFrame(loop),80);
+ scheduleLoop(token);
 }
 
 $('auto').onclick=()=>{
  running=!running;
  $('auto').textContent=running?'暂停自动记录':'开始自动记录';
  if(running){
-  ref=null;prev=null;changing=false;stableSince=0;stableAnchor=null;changeSince=0;
-  say('正在初始化参考页…');loop(performance.now());
- }else{cancelAnimationFrame(raf);say('自动记录已暂停')}
+  runToken++;lastPhotoFrame=null;prev=null;changing=false;
+  stableSince=0;stableAnchor=null;changeSince=0;changeStartedAt=0;
+  say('正在拍摄第一张参考照片…');loop(performance.now(),runToken);
+ }else{
+  runToken++;clearTimeout(timer);cancelAnimationFrame(raf);say('自动记录已暂停');
+ }
 };
 
 $('export').onclick=async()=>{

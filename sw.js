@@ -1,4 +1,4 @@
-const C='ppt-auto-camera-v2';
+const C='ppt-auto-camera-v3';
 const ASSETS=['./','./index.html','./manifest.webmanifest','./icon.svg'];
 self.addEventListener('install',e=>{
  self.skipWaiting();
